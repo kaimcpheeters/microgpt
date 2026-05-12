@@ -37,7 +37,7 @@ def load_module_without_main():
 
 class TestMicroGPTTinygradIntegration(unittest.TestCase):
     def test_end_to_end(self):
-        from tinygrad import Tensor, nn
+        from tinygrad import Tensor
 
         old_cwd = os.getcwd()
         os.chdir(REPO_ROOT)
@@ -49,7 +49,9 @@ class TestMicroGPTTinygradIntegration(unittest.TestCase):
             self.assertGreater(len(ns["params"]), 0)
             for p in ns["params"]:
                 self.assertIsInstance(p, Tensor)
-            self.assertIsInstance(ns["optimizer"], nn.optim.Optimizer)
+                self.assertTrue(p.requires_grad)
+            self.assertIn("Adam", ns)
+            self.assertIsInstance(ns["optimizer"], ns["Adam"])
 
             buf = io.StringIO()
             with redirect_stdout(buf):

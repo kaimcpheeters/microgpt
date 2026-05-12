@@ -20,12 +20,15 @@ time, so a fresh exec gives a reproducible starting point per run.
 Usage:
     uv run benchmarks/benchmark.py
     uv run benchmarks/benchmark.py --train-steps 1000 --infer-samples 20
-    uv run benchmarks/benchmark.py --only pytorch,tinygrad --input-url <URL>
+    uv run benchmarks/benchmark.py --only pytorch,tinygrad
+    uv run benchmarks/benchmark.py --dataset shakespeare
+    uv run benchmarks/benchmark.py --input-url <URL>
 """
 
 import argparse
 import io
 import os
+import re
 import time
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -39,10 +42,49 @@ IMPLEMENTATIONS = [
     ("tinygrad",    SRC_DIR / "microgpt_tinygrad.py"),
 ]
 
+# Mirrors `DATASET_PRESETS` in web/src/App.tsx — the four files the GUI bundles
+# into web/public/. The benchmark resolves each preset to its repo-local copy
+# under inputs/ so a single `--dataset shakespeare` invocation exercises every
+# impl on the same bytes the browser would, no network required.
+DATASET_PRESETS: dict[str, Path] = {
+    "names":       REPO_ROOT / "inputs" / "names.txt",
+    "dinosaurs":   REPO_ROOT / "inputs" / "dinosaurs.txt",
+    "pokemon":     REPO_ROOT / "inputs" / "pokemon.txt",
+    "shakespeare": REPO_ROOT / "inputs" / "shakespeare.txt",
+}
 
-def load_module_without_main(path: Path) -> dict:
-    """Exec the .py script into a fresh namespace, minus the trailing train()/infer()."""
-    lines = path.read_text().splitlines()
+
+def _rewrite_input_url(code: str, input_url: str) -> str:
+    """Mirror `replaceLoadDatasetUrl` in web/src/patch.ts.
+
+    Vanilla microgpt.py keeps the dataset URL as a bare string literal in the
+    `load_dataset(input_url=…)` signature (no env-var indirection, by design —
+    the GUI source-rewriter stays trivial). Rewriting that literal at bench-
+    load time lets us drive vanilla onto any GUI-supported preset without
+    touching the on-disk source.
+    The env-aware ports (pytorch / tinygrad)
+    use `os.environ.get('MICROGPT_INPUT_URL', '<default>')` as the
+    default, which is not a quoted string at the `input_url=` position, so the
+    regex skips them — they're driven via MICROGPT_INPUT_URL instead.
+    """
+    return re.sub(
+        r"^(def load_dataset\(input_url=)(['\"]).+?\2(\).*)$",
+        rf"\1\2{input_url}\2\3",
+        code,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+
+def load_module_without_main(path: Path, input_url: str | None = None) -> dict:
+    """Exec the .py script into a fresh namespace, minus the trailing train()/infer().
+
+    When `input_url` is given, also patches vanilla microgpt.py's hardcoded
+    load_dataset URL (see `_rewrite_input_url`)."""
+    text = path.read_text()
+    if input_url:
+        text = _rewrite_input_url(text, input_url)
+    lines = text.splitlines()
     while lines and lines[-1].strip() in ("", "train()", "infer()"):
         lines.pop()
     code = "\n".join(lines) + "\n"
@@ -59,11 +101,12 @@ def _time(fn) -> float:
     return time.perf_counter() - start
 
 
-def benchmark(label: str, path: Path, train_steps: int, infer_samples: int) -> dict[str, float]:
+def benchmark(label: str, path: Path, train_steps: int, infer_samples: int,
+              input_url: str | None) -> dict[str, float]:
     print(f"\n=== {label}: {path.relative_to(REPO_ROOT)} ===")
 
     t0 = time.perf_counter()
-    ns = load_module_without_main(path)
+    ns = load_module_without_main(path, input_url=input_url)
     load_t = time.perf_counter() - t0
     print(f"  {'load + param init':<32} {load_t:8.3f} s")
 
@@ -87,13 +130,19 @@ def main() -> None:
     parser.add_argument("--only", type=str, default=None,
                         help="comma-separated subset of impls to run, e.g. 'pytorch,tinygrad' "
                              "(default: run all)")
-    parser.add_argument("--input-url", type=str, default=None,
-                        help="dataset URL; pre-fetches to the URL-derived filename (e.g. names.txt) and sets "
-                             "MICROGPT_INPUT_URL so every impl's load_dataset() short-circuits on the cache "
-                             "(default: each impl's built-in)")
+    src = parser.add_mutually_exclusive_group()
+    src.add_argument("--dataset", type=str, default=None,
+                     choices=sorted(DATASET_PRESETS),
+                     help="one of the GUI's preset datasets (names, dinosaurs, pokemon, "
+                          "shakespeare); reads inputs/<name>.txt directly with cwd=inputs/ "
+                          "(no fetch, no copy) (default: each impl's built-in)")
+    src.add_argument("--input-url", type=str, default=None,
+                     help="dataset URL (http(s):// or file://); pre-fetches to the URL-derived "
+                          "filename (e.g. names.txt) so every impl's load_dataset() short-circuits "
+                          "on the cache")
     parser.add_argument("--seed", type=int, default=None,
-                        help="override MICROGPT_SEED for impls that read it (pytorch/tinygrad; pure python "
-                             "uses its hardcoded seed by design)")
+                        help="override MICROGPT_SEED for impls that read it "
+                             "(pytorch/tinygrad; pure python uses its hardcoded seed by design)")
     args = parser.parse_args()
 
     # `--only pytorch,tinygrad` filters IMPLEMENTATIONS to the requested labels (order preserved from the
@@ -107,28 +156,49 @@ def main() -> None:
             parser.error(f"--only: unknown label(s) {missing}; valid: {list(by_label)}")
         impls = [by_label[w] for w in wanted]
 
-    # --input-url: set env var for the env-aware ports' load_dataset(), AND pre-fetch the file to
-    # the URL-derived basename. Every impl's load_dataset() short-circuits on `os.path.exists(fname)`
-    # where `fname = input_url.rsplit('/', 1)[-1]`, so a single pre-fetch is shared across all three.
-    # Vanilla microgpt.py has no env-var support (kept hardcoded so the GUI source-rewriter stays
-    # trivial); it picks up the cache because it derives the same fname from its built-in URL.
-    if args.input_url:
-        os.environ["MICROGPT_INPUT_URL"] = args.input_url
-        fname = args.input_url.rsplit("/", 1)[-1] or "input.txt"
+    # Resolve the dataset source. Two paths:
+    #
+    #   --dataset <preset>   maps to inputs/<preset>.txt, which is already on
+    #                        disk. We just chdir to inputs/ for the run, and
+    #                        each impl's `load_dataset()` finds <preset>.txt
+    #                        by basename in cwd — zero copies, zero fetches.
+    #   --input-url <URL>    arbitrary http(s):// (or file://) URL. We pre-
+    #                        fetch into REPO_ROOT/<basename> so the same
+    #                        `os.path.exists(fname)` cache lookup short-
+    #                        circuits the urllib path inside the scripts.
+    #
+    # Either way we export MICROGPT_INPUT_URL for the env-aware ports and feed
+    # `input_url` to load_module_without_main() so vanilla microgpt.py's
+    # hardcoded literal gets rewritten to match (mirroring what
+    # web/src/patch.ts does in-browser).
+    input_url: str | None = None
+    run_cwd: Path = REPO_ROOT
+    if args.dataset:
+        path = DATASET_PRESETS[args.dataset]
+        if not path.exists():
+            parser.error(f"--dataset {args.dataset!r}: expected file at {path} (missing)")
+        input_url = path.absolute().as_uri()
+        run_cwd = path.parent
+    elif args.input_url:
+        input_url = args.input_url
+        fname = input_url.rsplit("/", 1)[-1] or "input.txt"
         cached = REPO_ROOT / fname
         cached.unlink(missing_ok=True)
         import urllib.request
-        print(f"[setup] fetching {args.input_url} -> {cached.name}")
-        urllib.request.urlretrieve(args.input_url, cached)
+        print(f"[setup] fetching {input_url} -> {cached.name}")
+        urllib.request.urlretrieve(input_url, cached)
+
+    if input_url:
+        os.environ["MICROGPT_INPUT_URL"] = input_url
     if args.seed is not None:
         os.environ["MICROGPT_SEED"] = str(args.seed)
 
     old_cwd = os.getcwd()
-    os.chdir(REPO_ROOT)
+    os.chdir(run_cwd)
     results: dict[str, dict[str, float]] = {}
     try:
         for label, path in impls:
-            results[label] = benchmark(label, path, args.train_steps, args.infer_samples)
+            results[label] = benchmark(label, path, args.train_steps, args.infer_samples, input_url)
     finally:
         os.chdir(old_cwd)
 

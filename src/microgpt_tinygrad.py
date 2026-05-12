@@ -8,7 +8,7 @@ Everything else is just efficiency.
 
 import os       # os.path.exists
 import random   # random.seed, random.choices, random.gauss, random.shuffle
-from tinygrad import Tensor, TinyJit, nn # tensors, autograd, optimizers, kernel cache
+from tinygrad import Tensor, TinyJit # tensors, autograd, kernel cache
 random.seed(int(os.environ.get('MICROGPT_SEED', 42))) # Let there be order among chaos
 Tensor.manual_seed(int(os.environ.get('MICROGPT_SEED', 42)))
 
@@ -30,7 +30,6 @@ vocab_size = len(uchars) + 1 # total number of unique tokens, +1 is for BOS
 print(f"vocab size: {vocab_size}")
 
 # Let there be Autograd to recursively apply the chain rule through a computation graph
-# tinygrad provides this: Tensors track ops; .backward() walks the graph; the optimizer flips on requires_grad.
 
 # Initialize the parameters, to store the knowledge of the model
 n_layer = 1     # depth of the transformer neural network (number of layers)
@@ -48,18 +47,17 @@ for i in range(n_layer):
     state_dict[f'layer{i}.mlp_fc1'] = matrix(4 * n_embd, n_embd)
     state_dict[f'layer{i}.mlp_fc2'] = matrix(n_embd, 4 * n_embd)
 params = list(state_dict.values()) # collect the trainable Tensors
+for p in params: p.requires_grad = True # the (... * std) above strips requires_grad from the leaf
 print(f"num params: {sum(p.numel() for p in params)}")
 
-# Define the model architecture: a function mapping a sequence of tokens to logits over what comes next.
-# Follow GPT-2 with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU.
-# Idiomatic tinygrad: the forward processes the WHOLE sequence (shape (T, n_embd)) in one call with a
-# causal attention mask, instead of the per-token KV-cache loop the other two files use. This keeps the
-# graph shape stable across positions, which is how tinygrad expects to be used.
+# Define the model architecture: a function mapping tokens and parameters to logits over what comes next
+# Follow GPT-2, blessed among the GPTs, with minor differences: layernorm -> rmsnorm, no biases, GeLU -> ReLU
+# tinygrad: the forward processes the WHOLE sequence in one call with a causal mask (vs the per-token KV-cache loop)
 def linear(x, w):
-    return x @ w.T # batched: x of shape (..., n_in) @ (n_in, n_out) -> (..., n_out)
+    return x @ w.T
 
 def softmax(logits):
-    return logits.softmax() # along last dim by default
+    return logits.softmax()
 
 def rmsnorm(x):
     ms = (x * x).mean(axis=-1, keepdim=True)
@@ -68,28 +66,27 @@ def rmsnorm(x):
 
 def gpt(tokens):
     T = tokens.shape[0]
-    tok_emb = state_dict['wte'][tokens] # (T, n_embd) embedding lookup via fancy indexing
-    pos_emb = state_dict['wpe'][:T]     # (T, n_embd) first T position embeddings
-    x = tok_emb + pos_emb               # joint token and position embedding
+    tok_emb = state_dict['wte'][tokens] # token embedding
+    pos_emb = state_dict['wpe'][:T] # position embedding
+    x = tok_emb + pos_emb # joint token and position embedding
     x = rmsnorm(x) # note: not redundant due to backward pass via the residual connection
 
     for li in range(n_layer):
-        # 1) Multi-head Attention block, causal
+        # 1) Multi-head Attention block
         x_residual = x
         x = rmsnorm(x)
-        q = linear(x, state_dict[f'layer{li}.attn_wq']) # (T, n_embd)
+        q = linear(x, state_dict[f'layer{li}.attn_wq'])
         k = linear(x, state_dict[f'layer{li}.attn_wk'])
         v = linear(x, state_dict[f'layer{li}.attn_wv'])
-        # split into heads: (T, n_embd) -> (n_head, T, head_dim)
         q = q.reshape(T, n_head, head_dim).transpose(0, 1)
         k = k.reshape(T, n_head, head_dim).transpose(0, 1)
         v = v.reshape(T, n_head, head_dim).transpose(0, 1)
-        attn_logits = (q @ k.transpose(-2, -1)) / head_dim**0.5 # (n_head, T, T)
-        mask = Tensor.ones(T, T).tril()                         # 1 on/below diagonal, 0 above (causal)
-        attn_logits = mask.where(attn_logits, -float('inf'))    # mask out future positions
+        attn_logits = (q @ k.transpose(-2, -1)) / head_dim**0.5
+        mask = Tensor.ones(T, T).tril() # causal mask
+        attn_logits = mask.where(attn_logits, -float('inf'))
         attn_weights = attn_logits.softmax(axis=-1)
-        x_attn = attn_weights @ v                               # (n_head, T, head_dim)
-        x_attn = x_attn.transpose(0, 1).reshape(T, n_embd)      # merge heads back
+        x_attn = attn_weights @ v
+        x_attn = x_attn.transpose(0, 1).reshape(T, n_embd)
         x = linear(x_attn, state_dict[f'layer{li}.attn_wo'])
         x = x + x_residual
         # 2) MLP block
@@ -100,30 +97,59 @@ def gpt(tokens):
         x = linear(x, state_dict[f'layer{li}.mlp_fc2'])
         x = x + x_residual
 
-    logits = linear(x, state_dict['lm_head']) # (T, vocab_size)
+    logits = linear(x, state_dict['lm_head'])
     return logits
 
 # Let there be Adam, the blessed optimizer and its buffers
+# tinygrad: buffers are Tensors (not Python scalars) so the whole optimizer step compiles into the JIT graph
+class Adam:
+    def __init__(self, params, lr, b1, b2, eps):
+        self.params, self.b1, self.b2, self.eps = params, b1, b2, eps
+        self.lr = Tensor([lr], requires_grad=False).contiguous()
+        self.m = [Tensor.zeros(*p.shape, requires_grad=False).contiguous() for p in params] # first moment buffer
+        self.v = [Tensor.zeros(*p.shape, requires_grad=False).contiguous() for p in params] # second moment buffer
+        self.b1_t = Tensor.ones(1, requires_grad=False).contiguous()
+        self.b2_t = Tensor.ones(1, requires_grad=False).contiguous()
+
+    def zero_grad(self):
+        for p in self.params:
+            p.grad = None
+
+    def step(self):
+        self.b1_t.assign(self.b1_t * self.b1)
+        self.b2_t.assign(self.b2_t * self.b2)
+        for i, p in enumerate(self.params):
+            g = p.grad
+            self.m[i].assign(self.b1 * self.m[i] + (1 - self.b1) * g)
+            self.v[i].assign(self.b2 * self.v[i] + (1 - self.b2) * g * g)
+            m_hat = self.m[i] / (1 - self.b1_t)
+            v_hat = self.v[i] / (1 - self.b2_t)
+            p.assign(p.detach() - self.lr * m_hat / (v_hat.sqrt() + self.eps))
+
 learning_rate, beta1, beta2, eps_adam = 0.01, 0.85, 0.99, 1e-8
-optimizer = nn.optim.Adam(params, lr=learning_rate, b1=beta1, b2=beta2, eps=eps_adam)
+optimizer = Adam(params, lr=learning_rate, b1=beta1, b2=beta2, eps=eps_adam)
 
 # Repeat in sequence
 def train(num_steps=1000): # number of training steps
-    Tensor.training = True # tinygrad: required for optimizer.step()
+    Tensor.training = True # tinygrad: required for backward()
 
-    # The forward+backward+update for ONE step, with shape-stable inputs (block_size).
-    # @TinyJit traces the graph on the first call and replays the compiled kernels on every subsequent
-    # call: one compile, then constant-time replay. Padding every doc to block_size is what makes this
-    # safe -- the graph shape is identical every step.
+    # tinygrad: @TinyJit traces this once and replays the compiled kernels on every later call. Padding
+    # every doc to block_size (below) keeps the graph shape identical every step.
     @TinyJit
     def step_fn(input_tokens, target_tokens, mask):
         optimizer.zero_grad()
-        logits = gpt(input_tokens)                                                # (block_size, vocab_size)
+        # Forward the token sequence through the model, building up the computation graph all the way to the loss
+        logits = gpt(input_tokens)
         probs = softmax(logits)
-        per_pos_loss = -probs[Tensor.arange(block_size), target_tokens].log()     # (block_size,)
-        loss = (per_pos_loss * mask).sum() / mask.sum()                           # average over VALID positions only
+        per_pos_loss = -probs[Tensor.arange(block_size), target_tokens].log()
+        loss = (per_pos_loss * mask).sum() / mask.sum() # final average loss over the document sequence. May yours be low.
+        # Backward the loss, calculating the gradients with respect to all model parameters
         loss.backward()
+        # Adam optimizer update: update the model parameters based on the corresponding gradients
         optimizer.step()
+        # tinygrad: the JIT only traces ops whose outputs are realized; without this realize() the
+        # side-effect .assign()s on m/v/b1_t/b2_t/params get dropped on JIT replay.
+        Tensor.realize(loss, *params, *optimizer.m, *optimizer.v, optimizer.b1_t, optimizer.b2_t)
         return loss
 
     for step in range(num_steps):
@@ -132,16 +158,13 @@ def train(num_steps=1000): # number of training steps
         doc = docs[step % len(docs)]
         tokens = [BOS] + [uchars.index(ch) for ch in doc] + [BOS]
         valid_n = min(block_size, len(tokens) - 1)
-        # Pad with BOS to a fixed length so step_fn sees the same shape every call.
-        tokens = (tokens + [BOS] * (block_size + 1 - len(tokens)))[:block_size + 1]
+        tokens = (tokens + [BOS] * (block_size + 1 - len(tokens)))[:block_size + 1] # pad to fixed shape for JIT
 
-        input_tokens = Tensor(tokens[:-1])                                          # (block_size,)
-        target_tokens = Tensor(tokens[1:])                                          # (block_size,)
-        mask = Tensor([1.0] * valid_n + [0.0] * (block_size - valid_n))             # only score valid positions
+        input_tokens = Tensor(tokens[:-1])
+        target_tokens = Tensor(tokens[1:])
+        mask = Tensor([1.0] * valid_n + [0.0] * (block_size - valid_n)) # only score valid positions
 
-        # Adam optimizer update: linear learning rate decay; .assign() mutates the lr tensor in place
-        # so the JIT'd step_fn picks up the new value without re-tracing.
-        optimizer.lr.assign(Tensor([learning_rate * (1 - step / num_steps)]))
+        optimizer.lr.assign(Tensor([learning_rate * (1 - step / num_steps)])) # linear learning rate decay
         loss = step_fn(input_tokens, target_tokens, mask)
 
         print(f"step {step+1:4d} / {num_steps:4d} | loss {loss.item():.4f}", end='\r')
@@ -151,20 +174,18 @@ def infer(temperature=0.5, num_samples=20): # in (0, 1], control the "creativity
     Tensor.training = False
     print("\n--- inference (new, hallucinated names) ---")
 
-    # Same shape-stability trick as train(): pad to block_size on every call so step_fn sees one shape
-    # and JIT compiles once. The causal mask in gpt() guarantees the logits at position i depend only on
-    # positions 0..i, so the padded tail can be filled with anything (we use BOS) without affecting the
-    # logits we actually sample from.
+    # tinygrad: same shape-stability trick as train() -- pad to block_size so the JIT compiles once. The
+    # causal mask in gpt() makes the padded tail invisible to the position we actually sample from.
     @TinyJit
     def step_fn(input_tokens):
-        return gpt(input_tokens) # (block_size, vocab_size)
+        return gpt(input_tokens)
 
     for sample_idx in range(num_samples):
         tokens = [BOS]
         for pos_id in range(block_size):
-            padded = tokens + [BOS] * (block_size - len(tokens))   # pad to block_size with BOS
-            all_logits = step_fn(Tensor(padded))                   # (block_size, vocab_size), one cached graph
-            probs = softmax(all_logits[len(tokens) - 1] / temperature) # sample from the last REAL position
+            padded = tokens + [BOS] * (block_size - len(tokens))
+            all_logits = step_fn(Tensor(padded))
+            probs = softmax(all_logits[len(tokens) - 1] / temperature) # sample from the last real position
             token_id = random.choices(range(vocab_size), weights=probs.tolist())[0]
             if token_id == BOS:
                 break
