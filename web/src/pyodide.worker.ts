@@ -13,8 +13,17 @@ const PYODIDE_INDEX_URL = `https://cdn.jsdelivr.net/pyodide/v${PYODIDE_VERSION}/
 // identical bytes, no network round-trip. The reported URL stays the
 // canonical one so the UI matches what's documented in microgpt.py.
 const URL_ALIASES: Record<string, string> = {
-  "https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt": "/input.txt",
+  "https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt": "/names.txt",
 };
+
+// `load_dataset(input_url=…)` in microgpt.py derives the on-disk filename
+// from the URL's last segment (`url.rsplit('/', 1)[-1]`). We mirror that
+// here so the file we pre-write into Pyodide's FS matches what Python
+// will look for, short-circuiting the urllib fallback inside `load_dataset`.
+function filenameFromUrl(url: string): string {
+  const last = url.split("?")[0].split("#")[0].split("/").pop() ?? "";
+  return last || "input.txt";
+}
 
 export type RunPhase = "init" | "train" | "infer";
 
@@ -103,10 +112,10 @@ _b.print = _p
   return pyodideLoading;
 }
 
-// Fetch the dataset from the requested URL and seed it into Pyodide's FS as
-// `input.txt`. Once written, the script's `os.path.exists('input.txt')`
-// branch short-circuits the urllib fallback — the displayed URL literal
-// is honest documentation but never actually executes.
+// Fetch the dataset from the requested URL and seed it into Pyodide's FS
+// using the URL's basename. Once written, the script's
+// `os.path.exists(fname)` branch short-circuits the urllib fallback — the
+// displayed URL literal is honest documentation but never actually executes.
 function ensureReady(inputUrl: string): Promise<void> {
   if (readyState?.inputUrl === inputUrl) return readyState.promise;
 
@@ -121,7 +130,7 @@ function ensureReady(inputUrl: string): Promise<void> {
     const resp = await fetch(fetchUrl);
     if (!resp.ok) throw new Error(`Failed to fetch dataset (${fetchUrl}): ${resp.status}`);
     const txt = await resp.text();
-    py.FS.writeFile("input.txt", txt);
+    py.FS.writeFile(filenameFromUrl(inputUrl), txt);
     const numDocs = txt.split("\n").filter((l) => l.trim().length > 0).length;
     post({ type: "ready", numDocs, inputUrl });
   })();
@@ -131,7 +140,7 @@ function ensureReady(inputUrl: string): Promise<void> {
 }
 
 function prettySource(url: string): string {
-  if (url.startsWith("/") || url.startsWith("./")) return "bundled input.txt";
+  if (url.startsWith("/") || url.startsWith("./")) return `bundled ${filenameFromUrl(url)}`;
   try {
     const u = new URL(url, self.location.href);
     return u.hostname || url;
@@ -192,7 +201,11 @@ self.onmessage = async (ev: MessageEvent<WorkerInbound>) => {
       // functions and re-initializes `state_dict` with the current seed.
       // Then explicitly call `train(num_steps=N)` so num_steps flows
       // through Python's own kwarg machinery — no source patching needed.
-      const prepared = prepareTrainingScript(msg.code, msg.options.seed);
+      const prepared = prepareTrainingScript(
+        msg.code,
+        msg.options.seed,
+        readyState.inputUrl,
+      );
       const t0 = performance.now();
       post({ type: "status", status: "running", phase: "train" });
       try {

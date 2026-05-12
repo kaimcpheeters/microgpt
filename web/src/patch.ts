@@ -11,24 +11,33 @@ function replaceSeedLiteral(code: string, seed: number): string {
   return code.replace(/^(random\.seed\()\s*\d+\s*(\).*)$/m, `$1${seed}$2`);
 }
 
+function replaceLoadDatasetUrl(code: string, inputUrl: string): string {
+  return code.replace(
+    /^(def load_dataset\(input_url=)(['"]).+?\2(\).*)$/m,
+    `$1$2${inputUrl}$2$3`,
+  );
+}
+
 /**
  * Prepare `microgpt.py` for a Train run.
  *
- * Two changes:
+ * Three changes:
  *   1. Patch the seed literal so `state_dict` is reproducibly initialized
  *      with the user's chosen seed.
- *   2. Strip the two demo call sites at the bottom (`train()` and
+ *   2. Patch the `load_dataset` default URL so the module-level
+ *      `docs = load_dataset()` reads the file the worker pre-wrote into
+ *      Pyodide's FS (the Python derives the filename from the URL).
+ *   3. Strip the two demo call sites at the bottom (`train()` and
  *      `infer()`). Running the script then only defines functions and
  *      initializes state; the worker drives `train(num_steps=…)` and
  *      `infer(temperature=…, num_samples=…)` explicitly so it can time
  *      them and surface progress separately.
  *
- * Every other UI-controlled value (num_steps, temperature, num_samples,
- * input_url) flows through Python kwargs at call time — no source
- * rewriting needed.
+ * Every other UI-controlled value (num_steps, temperature, num_samples)
+ * flows through Python kwargs at call time — no source rewriting needed.
  */
-export function prepareTrainingScript(code: string, seed: number): string {
-  return replaceSeedLiteral(code, seed)
+export function prepareTrainingScript(code: string, seed: number, inputUrl: string): string {
+  return replaceLoadDatasetUrl(replaceSeedLiteral(code, seed), inputUrl)
     .replace(/^train\(\)\s*$/m, "")
     .replace(/^infer\(\)\s*$/m, "");
 }
@@ -53,11 +62,7 @@ export function patchDisplayCode(
   inputUrl: string,
 ): string {
   if (!code) return code;
-  return replaceSeedLiteral(code, train.seed)
-    .replace(
-      /^(def load_dataset\(input_url=)(['"]).+?\2(\).*)$/m,
-      `$1$2${inputUrl}$2$3`,
-    )
+  return replaceLoadDatasetUrl(replaceSeedLiteral(code, train.seed), inputUrl)
     .replace(/^(def train\(num_steps=)\d+(\):.*)$/m, `$1${train.numSteps}$2`)
     .replace(
       /^(def infer\(temperature=)[\d.]+(,\s*num_samples=)\d+(\):.*)$/m,

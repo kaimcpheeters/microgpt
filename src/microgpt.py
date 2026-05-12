@@ -13,10 +13,11 @@ random.seed(42) # Let there be order among chaos
 
 # Let there be a Dataset `docs`: list[str] of documents (e.g. a list of names)
 def load_dataset(input_url='https://raw.githubusercontent.com/karpathy/makemore/988aa59/names.txt'):
-    if not os.path.exists('input.txt'):
+    fname = input_url.rsplit('/', 1)[-1]
+    if not os.path.exists(fname):
         import urllib.request
-        urllib.request.urlretrieve(input_url, 'input.txt')
-    return [line.strip() for line in open('input.txt') if line.strip()]
+        urllib.request.urlretrieve(input_url, fname)
+    return [line.strip() for line in open(fname) if line.strip()]
 docs = load_dataset()
 random.shuffle(docs)
 print(f"num docs: {len(docs)}")
