@@ -1,0 +1,10 @@
+# Enable cross-origin isolation so SharedArrayBuffer is available. The
+# app uses it for Pyodide's interrupt buffer, which lets the Stop button
+# cancel a running train/infer cooperatively instead of nuking the worker.
+#
+# Syntax recognized by Netlify and Cloudflare Pages. On other hosts
+# (Vercel, S3+CloudFront, plain nginx) the same two headers must be set
+# via the host's native config — see vite.config.ts for the values.
+/*
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Embedder-Policy: credentialless

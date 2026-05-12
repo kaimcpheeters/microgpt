@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --color-ink-950: #07070b;
+  --color-ink-900: #0c0d12;
+  --color-ink-800: #14151c;
+  --color-ink-700: #1b1d27;
+  --color-ink-600: #2a2d3a;
+  --color-ink-500: #3a3e4d;
+  --color-ink-400: #565b6e;
+  --color-ink-300: #8b91a6;
+  --color-ink-200: #c8cbd6;
+  --color-ink-100: #e6e8ef;
+  --color-accent: #a78bfa;
+  --color-accent-strong: #7c5cff;
+  --color-accent-warm: #f0abfc;
+  --color-good: #67e8a4;
+  --color-warn: #fbbf24;
+}
+
+html, body, #root {
+  height: 100%;
+  background: var(--color-ink-950);
+  color: var(--color-ink-100);
+}
+
+body {
+  font-family: var(--font-sans);
+  font-feature-settings: "cv11", "ss01", "ss03";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Subtle radial backdrop */
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(1100px 600px at 12% -10%, rgba(124, 92, 255, 0.18), transparent 60%),
+    radial-gradient(900px 500px at 95% 0%, rgba(240, 171, 252, 0.10), transparent 60%),
+    radial-gradient(700px 400px at 50% 110%, rgba(103, 232, 164, 0.06), transparent 60%);
+  z-index: 0;
+}
+
+/* Scrollbar styling */
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-ink-600);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-ink-500);
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+
+/* Pulse keyframes for live indicators */
+@keyframes glow-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(124, 92, 255, 0.5); }
+  50% { box-shadow: 0 0 0 8px rgba(124, 92, 255, 0); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
