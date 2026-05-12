@@ -88,8 +88,9 @@ def main() -> None:
                         help="comma-separated subset of impls to run, e.g. 'pytorch,tinygrad' "
                              "(default: run all)")
     parser.add_argument("--input-url", type=str, default=None,
-                        help="dataset URL; pre-fetches to input.txt and sets MICROGPT_INPUT_URL so every "
-                             "impl's load_dataset() short-circuits on the cache (default: each impl's built-in)")
+                        help="dataset URL; pre-fetches to the URL-derived filename (e.g. names.txt) and sets "
+                             "MICROGPT_INPUT_URL so every impl's load_dataset() short-circuits on the cache "
+                             "(default: each impl's built-in)")
     parser.add_argument("--seed", type=int, default=None,
                         help="override MICROGPT_SEED for impls that read it (pytorch/tinygrad; pure python "
                              "uses its hardcoded seed by design)")
@@ -107,12 +108,14 @@ def main() -> None:
         impls = [by_label[w] for w in wanted]
 
     # --input-url: set env var for the env-aware ports' load_dataset(), AND pre-fetch the file to
-    # input.txt. The pre-fetch is what lets vanilla microgpt.py (hardcoded URL by design, no env var
-    # support to keep GUI source-rewriting working) ride along on the same dataset -- every
-    # load_dataset() short-circuits on `os.path.exists('input.txt')` and reuses the cache.
+    # the URL-derived basename. Every impl's load_dataset() short-circuits on `os.path.exists(fname)`
+    # where `fname = input_url.rsplit('/', 1)[-1]`, so a single pre-fetch is shared across all three.
+    # Vanilla microgpt.py has no env-var support (kept hardcoded so the GUI source-rewriter stays
+    # trivial); it picks up the cache because it derives the same fname from its built-in URL.
     if args.input_url:
         os.environ["MICROGPT_INPUT_URL"] = args.input_url
-        cached = REPO_ROOT / "input.txt"
+        fname = args.input_url.rsplit("/", 1)[-1] or "input.txt"
+        cached = REPO_ROOT / fname
         cached.unlink(missing_ok=True)
         import urllib.request
         print(f"[setup] fetching {args.input_url} -> {cached.name}")

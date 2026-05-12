@@ -69,3 +69,59 @@ export function patchDisplayCode(
       `$1${infer.temperature}$2${infer.numSamples}$3`,
     );
 }
+
+// Collapse the env-var pattern used by the PyTorch / tinygrad ports back
+// to their bare literal defaults so the rendered diff against vanilla
+// stays focused on real algorithmic differences. The runtime scripts keep
+// the env-var indirection so `MICROGPT_SEED=… MICROGPT_INPUT_URL=… python
+// microgpt_pytorch.py` continues to work for the benchmark harness; these
+// regexes only fire on the in-browser viewer, never on executed code.
+function stripEnvVarIndirection(code: string): string {
+  return code
+    .replace(
+      /int\(os\.environ\.get\(['"]MICROGPT_SEED['"]\s*,\s*(\d+)\)\)/g,
+      "$1",
+    )
+    .replace(
+      /os\.environ\.get\(['"]MICROGPT_INPUT_URL['"]\s*,\s*(['"][^'"]+['"])\)/g,
+      "$1",
+    );
+}
+
+/**
+ * Same idea as `patchDisplayCode`, but for the PyTorch / tinygrad ports
+ * shown in the side-by-side diff. They aren't executed in the browser, so
+ * the patches are purely cosmetic, but they keep the rendered comparison
+ * honest:
+ *
+ *   1. Strip the `int(os.environ.get('MICROGPT_SEED', N))` indirection
+ *      and the matching `os.environ.get('MICROGPT_INPUT_URL', '…')` so
+ *      the displayed source has the same shape as vanilla.
+ *   2. Replace every `random.seed` / `torch.manual_seed` /
+ *      `Tensor.manual_seed` literal with the UI seed.
+ *   3. Apply the same `load_dataset` / `train` / `infer` signature
+ *      substitutions as vanilla.
+ */
+export function patchAltDisplayCode(
+  code: string,
+  train: TrainOptions,
+  infer: InferOptions,
+  inputUrl: string,
+): string {
+  if (!code) return code;
+  const normalized = stripEnvVarIndirection(code);
+  return normalized
+    .replace(
+      /\b(random\.seed|torch\.manual_seed|Tensor\.manual_seed)\(\s*\d+\s*\)/g,
+      `$1(${train.seed})`,
+    )
+    .replace(
+      /^(def load_dataset\(input_url=)(['"]).+?\2(\).*)$/m,
+      `$1$2${inputUrl}$2$3`,
+    )
+    .replace(/^(def train\(num_steps=)\d+(\):.*)$/m, `$1${train.numSteps}$2`)
+    .replace(
+      /^(def infer\(temperature=)[\d.]+(,\s*num_samples=)\d+(\):.*)$/m,
+      `$1${infer.temperature}$2${infer.numSamples}$3`,
+    );
+}

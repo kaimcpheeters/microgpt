@@ -1,8 +1,10 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type SyntheticEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { CodeViewer } from "./CodeViewer";
+import { CodeDiff } from "./CodeDiff";
 import {
   DEFAULT_INFER,
   DEFAULT_TRAIN,
+  patchAltDisplayCode,
   patchDisplayCode,
   type InferOptions,
   type TrainOptions,
@@ -73,37 +75,37 @@ function prettyInputSource(url: string): string {
   }
 }
 
-// Minimal client-side routing. We only have two views (home + about), so
-// a full router would be overkill. We mirror the pathname into state and
-// expose `navigate()` for in-app links; the browser back/forward buttons
-// are handled via `popstate`. Direct hits to `/about` work because the
-// host (Vite dev/preview, Netlify/Cloudflare Pages) serves index.html as
-// the SPA fallback.
-type Route = "home" | "about";
+// Implementation tabs. The vanilla Python file is the only one we actually
+// run in Pyodide — selecting `pytorch` or `tinygrad` opens a read-only
+// side-by-side diff against vanilla. The runtime controls (Train / Infer)
+// continue to operate on the vanilla source regardless of this tab.
+type Impl = "python" | "pytorch" | "tinygrad";
+type CompareWith = Exclude<Impl, "python">;
 
-function routeFromPath(pathname: string): Route {
-  return pathname === "/about" || pathname.startsWith("/about/") ? "about" : "home";
+const COMPARE_LABELS: Record<CompareWith, { tab: string; filename: string }> = {
+  pytorch: { tab: "pytorch", filename: "microgpt_pytorch.py" },
+  tinygrad: { tab: "tinygrad", filename: "microgpt_tinygrad.py" },
+};
+
+function isCompareWith(value: string | null): value is CompareWith {
+  return value === "pytorch" || value === "tinygrad";
 }
 
-function useRoute(): { route: Route; navigate: (next: Route, e?: SyntheticEvent) => void } {
-  const [route, setRoute] = useState<Route>(() =>
-    typeof window === "undefined" ? "home" : routeFromPath(window.location.pathname),
-  );
-  useEffect(() => {
-    const onPop = () => setRoute(routeFromPath(window.location.pathname));
-    window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
-  }, []);
-  const navigate = useCallback((next: Route, e?: SyntheticEvent) => {
-    if (e) e.preventDefault();
-    const path = next === "about" ? "/about" : "/";
-    if (window.location.pathname !== path) {
-      window.history.pushState(null, "", path + window.location.search);
-    }
-    setRoute(next);
-    window.scrollTo({ top: 0 });
-  }, []);
-  return { route, navigate };
+function readCompareFromLocation(): CompareWith | null {
+  if (typeof window === "undefined") return null;
+  const params = new URLSearchParams(window.location.search);
+  const raw = params.get("compare");
+  return isCompareWith(raw) ? raw : null;
+}
+
+function syncCompareToLocation(value: CompareWith | null) {
+  if (typeof window === "undefined") return;
+  const params = new URLSearchParams(window.location.search);
+  if (value) params.set("compare", value);
+  else params.delete("compare");
+  const qs = params.toString();
+  const next = window.location.pathname + (qs ? `?${qs}` : "") + window.location.hash;
+  window.history.replaceState(null, "", next);
 }
 
 // One config per status, instead of four parallel records keyed by it.
@@ -178,7 +180,6 @@ function allocateInterruptBuffer(): Uint8Array | null {
 }
 
 export default function App() {
-  const { route, navigate } = useRoute();
   const [code, setCode] = useState<string>("");
   const [codeError, setCodeError] = useState<string | null>(null);
 
@@ -200,6 +201,17 @@ export default function App() {
   const [inferOpts, setInferOpts] = useState<InferOptions>(DEFAULT_INFER);
   const [inputUrl, setInputUrl] = useState<string>(() => readInputUrlFromLocation());
   const [inputUrlDraft, setInputUrlDraft] = useState<string>(inputUrl);
+
+  const [compareWith, setCompareWithState] = useState<CompareWith | null>(() =>
+    readCompareFromLocation(),
+  );
+  // Lazy cache of fetched alt-impl sources, keyed by the CompareWith tag.
+  // First selection of a tab triggers a fetch; subsequent toggles to the
+  // same tab are free. Errors are remembered too so the UI doesn't refetch
+  // a 404 on every re-open.
+  const [altCodeCache, setAltCodeCache] = useState<
+    Partial<Record<CompareWith, { code?: string; error?: string }>>
+  >({});
 
   // Allocated once per app load. Shared across all worker generations so a
   // post-stop reboot still has cooperative cancellation wired up.
@@ -382,6 +394,41 @@ export default function App() {
     };
   }, [createWorker]);
 
+  // Lazy-fetch the alt-impl source the first time it's selected. We never
+  // refetch a cached success or error (page reload re-arms the cache).
+  useEffect(() => {
+    if (!compareWith) return;
+    if (altCodeCache[compareWith]) return;
+    const filename = COMPARE_LABELS[compareWith].filename;
+    let cancelled = false;
+    fetch(`/${filename}`)
+      .then((r) => {
+        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        return r.text();
+      })
+      .then((text) => {
+        if (cancelled) return;
+        setAltCodeCache((prev) => ({ ...prev, [compareWith]: { code: text } }));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setAltCodeCache((prev) => ({
+          ...prev,
+          [compareWith]: { error: err?.message ?? String(err) },
+        }));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [compareWith, altCodeCache]);
+
+  // Single setter that mirrors selection into the URL so a reload keeps
+  // the active comparison.
+  const setCompareWith = useCallback((next: CompareWith | null) => {
+    setCompareWithState(next);
+    syncCompareToLocation(next);
+  }, []);
+
   useEffect(() => {
     const el = terminalRef.current;
     if (!el) return;
@@ -473,29 +520,37 @@ export default function App() {
     [code, trainOpts, inferOpts, inputUrl],
   );
 
+  const altEntry = compareWith ? altCodeCache[compareWith] : undefined;
+  const altCodeRaw = altEntry?.code ?? "";
+  const altCodeError = altEntry?.error ?? null;
+  // Apply the same UI-sync (slider + dataset URL) to the alt-impl viewer
+  // and collapse its env-var indirection so the rendered diff lines up
+  // with vanilla. Cosmetic only — `altCodeRaw` is never executed.
+  const altCode = useMemo(
+    () => patchAltDisplayCode(altCodeRaw, trainOpts, inferOpts, inputUrl),
+    [altCodeRaw, trainOpts, inferOpts, inputUrl],
+  );
+
   const isTraining = status === "training";
   const isInferring = status === "inferring";
   const isBusy =
     status === "booting" || status === "loading-pyodide" || status === "fetching-data";
   const workerReady = !isBusy;
 
-  if (route === "about") {
-    return (
-      <div className="relative z-10 min-h-screen flex flex-col">
-        <Header status={status} statusDetail={statusDetail} navigate={navigate} />
-        <AboutPage />
-        <Footer route={route} navigate={navigate} />
-      </div>
-    );
-  }
-
   return (
-    <div className="relative z-10 min-h-screen flex flex-col">
-      <Header status={status} statusDetail={statusDetail} navigate={navigate} />
+    <div className="relative z-10 h-screen flex flex-col overflow-hidden">
+      <Header status={status} statusDetail={statusDetail} />
 
-      <main className="flex-1 px-4 md:px-6 lg:px-6 pb-4">
-        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] xl:grid-cols-[minmax(0,1fr)_360px] gap-4 h-[calc(100vh-7.5rem)] min-h-[680px]">
-          <CodePane code={displayCode} codeError={codeError} />
+      <main className="flex-1 min-h-0 px-4 md:px-6 lg:px-6 pb-4">
+        <div className="grid grid-cols-1 lg:grid-cols-[minmax(0,1fr)_340px] xl:grid-cols-[minmax(0,1fr)_360px] gap-4 h-full">
+          <CodePane
+            code={displayCode}
+            codeError={codeError}
+            compareWith={compareWith}
+            setCompareWith={setCompareWith}
+            altCode={altCode}
+            altCodeError={altCodeError}
+          />
           <div className="flex flex-col gap-3 min-h-0 overflow-y-auto pr-1 -mr-1">
             <DatasetCard
               inputUrl={inputUrl}
@@ -547,8 +602,6 @@ export default function App() {
           </div>
         </div>
       </main>
-
-      <Footer route={route} navigate={navigate} />
     </div>
   );
 }
@@ -556,32 +609,26 @@ export default function App() {
 function Header({
   status,
   statusDetail,
-  navigate,
 }: {
   status: RunStatus;
   statusDetail: string;
-  navigate: (next: Route, e?: SyntheticEvent) => void;
 }) {
   return (
     <header className="flex items-center justify-between gap-4 px-4 md:px-6 lg:px-6 pt-6 pb-4">
-      <a
-        href="/"
-        onClick={(e) => navigate("home", e)}
-        className="flex items-center gap-3 rounded-xl -mx-1 px-1 py-0.5 hover:opacity-90 focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60 transition-opacity"
-        aria-label="microgpt home"
-      >
+      <div className="flex items-center gap-3">
         <Logo />
         <div className="flex flex-col">
-          <h1 className="text-[22px] leading-none font-semibold tracking-tight">
+          <h1 className="flex items-center gap-1.5 text-[22px] leading-none font-semibold tracking-tight">
             <span className="bg-gradient-to-r from-violet-300 via-fuchsia-300 to-amber-200 bg-clip-text text-transparent">
               microgpt
             </span>
+            <AboutPopover />
           </h1>
           <p className="text-[12px] text-ink-300 mt-1">
             200 lines of pure Python — train a GPT in your browser
           </p>
         </div>
-      </a>
+      </div>
 
       <div className="flex items-center gap-3">
         <StatusPill status={status} detail={statusDetail} />
@@ -598,65 +645,51 @@ function Logo() {
   );
 }
 
-function Footer({
-  route,
-  navigate,
-}: {
-  route: Route;
-  navigate: (next: Route, e?: SyntheticEvent) => void;
-}) {
-  return (
-    <footer className="px-4 md:px-6 lg:px-6 py-2 mt-auto">
-      <div className="flex items-center justify-end gap-4 text-[11px] text-ink-400">
-        {route === "about" ? (
-          <a
-            href="/"
-            onClick={(e) => navigate("home", e)}
-            className="text-ink-300 hover:text-ink-100 transition-colors"
-          >
-            ← Back
-          </a>
-        ) : (
-          <a
-            href="/about"
-            onClick={(e) => navigate("about", e)}
-            className="text-ink-300 hover:text-ink-100 transition-colors"
-          >
-            About
-          </a>
-        )}
-      </div>
-    </footer>
-  );
-}
+function AboutPopover() {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef<HTMLSpanElement>(null);
 
-function AboutPage() {
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent) => {
+      if (!containerRef.current) return;
+      if (!containerRef.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
   return (
-    <main className="flex-1 px-4 md:px-6 lg:px-6 pb-8">
-      <div className="max-w-2xl mx-auto pt-6 pb-12">
-        <h2 className="text-[28px] font-semibold tracking-tight mb-4">
-          <span className="bg-gradient-to-r from-violet-300 via-fuchsia-300 to-amber-200 bg-clip-text text-transparent">
-            About microgpt
-          </span>
-        </h2>
-        <div className="space-y-4 text-[14px] leading-relaxed text-ink-200">
-          <p>
-            <span className="font-mono text-ink-100">microgpt</span> is Andrej Karpathy's
-            200-line, dependency-free Python implementation of a GPT — dataset, tokenizer,
-            autograd, GPT-2-style architecture, Adam optimizer, training loop, and inference
-            loop, all in a single file.
-          </p>
-          <p>
-            This page wraps that script in a browser UI: the source is rendered on the left,
-            and a Pyodide worker on the right trains and samples from it without leaving the
-            tab. Edit the sliders, hit{" "}
-            <span className="font-mono text-ink-100">Train microgpt</span>, watch the loss
-            come down.
-          </p>
-          <p>
-            Read the original write-up for the algorithmic walkthrough:
-          </p>
-          <p>
+    <span ref={containerRef} className="relative inline-flex">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-label="About microgpt"
+        aria-expanded={open}
+        className="inline-flex items-center justify-center size-4 rounded-full border border-ink-600 bg-ink-800/80 text-[10px] font-semibold text-ink-300 hover:text-ink-100 hover:border-ink-500 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-400/60"
+      >
+        i
+      </button>
+      {open ? (
+        <div
+          role="dialog"
+          aria-label="About microgpt"
+          className="absolute left-0 top-[calc(100%+8px)] z-50 w-[340px] rounded-xl border border-ink-700 bg-ink-900/95 backdrop-blur-md shadow-xl shadow-black/40 p-3.5"
+        >
+          <div className="space-y-2.5 text-[12px] leading-relaxed text-ink-200">
+            <p>
+              <span className="font-mono text-ink-100">microgpt</span> is Andrej
+              Karpathy's 200-line, dependency-free Python implementation of a GPT —
+              dataset, tokenizer, autograd, GPT-2 architecture, Adam, training and
+              inference loops, all in a single file.
+            </p>
             <a
               href="https://karpathy.github.io/2026/02/12/microgpt/"
               target="_blank"
@@ -664,7 +697,7 @@ function AboutPage() {
               className="inline-flex items-center gap-1.5 text-violet-200 hover:text-violet-100 underline decoration-violet-400/40 underline-offset-4 hover:decoration-violet-300 transition-colors"
             >
               karpathy.github.io/2026/02/12/microgpt
-              <svg width="12" height="12" viewBox="0 0 16 16" fill="none" aria-hidden>
+              <svg width="11" height="11" viewBox="0 0 16 16" fill="none" aria-hidden>
                 <path
                   d="M6 3h7v7M13 3 4 12"
                   stroke="currentColor"
@@ -674,10 +707,10 @@ function AboutPage() {
                 />
               </svg>
             </a>
-          </p>
+          </div>
         </div>
-      </div>
-    </main>
+      ) : null}
+    </span>
   );
 }
 
@@ -696,32 +729,117 @@ function StatusPill({ status, detail }: { status: RunStatus; detail: string }) {
   );
 }
 
-function CodePane({ code, codeError }: { code: string; codeError: string | null }) {
+function CodePane({
+  code,
+  codeError,
+  compareWith,
+  setCompareWith,
+  altCode,
+  altCodeError,
+}: {
+  code: string;
+  codeError: string | null;
+  compareWith: CompareWith | null;
+  setCompareWith: (next: CompareWith | null) => void;
+  altCode: string;
+  altCodeError: string | null;
+}) {
+  const activeTab: Impl = compareWith ?? "python";
+  // Click an alt tab to open the comparison; click the active alt tab again
+  // to close it and return to the single vanilla view.
+  const onSelectTab = (tab: Impl) => {
+    if (tab === "python") setCompareWith(null);
+    else setCompareWith(activeTab === tab ? null : tab);
+  };
+
+  const altReady = compareWith != null && altCode.length > 0;
+  const filenameLabel = compareWith
+    ? `microgpt.py ↔ ${COMPARE_LABELS[compareWith].filename}`
+    : "microgpt.py";
+
   return (
     <section className="relative rounded-2xl overflow-hidden border border-ink-700 bg-ink-900/60 backdrop-blur-sm flex flex-col min-h-0">
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-ink-700 bg-ink-900/80">
-        <div className="flex items-center gap-2">
-          <div className="flex gap-1.5">
+      <div className="flex items-center justify-between gap-3 px-4 py-2.5 border-b border-ink-700 bg-ink-900/80">
+        <div className="flex items-center gap-3 min-w-0">
+          <div className="flex gap-1.5 shrink-0">
             <span className="size-2.5 rounded-full bg-rose-400/70" />
             <span className="size-2.5 rounded-full bg-amber-400/70" />
             <span className="size-2.5 rounded-full bg-emerald-400/70" />
           </div>
-          <span className="ml-2 text-[12px] text-ink-300 font-mono">microgpt.py</span>
+          <ImplTabs active={activeTab} onSelect={onSelectTab} />
+          <span className="text-[11px] text-ink-400 font-mono truncate hidden md:inline">
+            {filenameLabel}
+          </span>
         </div>
-        <div className="text-[11px] text-ink-400 font-mono hidden sm:block">
+        <div className="text-[11px] text-ink-400 font-mono hidden sm:block tabular-nums shrink-0">
           {code ? `${code.split("\n").length} lines · ${(new Blob([code]).size / 1024).toFixed(1)} KB` : "—"}
         </div>
       </div>
       <div className="flex-1 min-h-0">
         {codeError ? (
-          <div className="p-6 text-rose-300 font-mono text-sm">Failed to load microgpt.py: {codeError}</div>
+          <div className="p-6 text-rose-300 font-mono text-sm">
+            Failed to load microgpt.py: {codeError}
+          </div>
         ) : !code ? (
           <div className="p-6 text-ink-400 font-mono text-sm">Loading source…</div>
+        ) : compareWith ? (
+          altCodeError ? (
+            <div className="p-6 text-rose-300 font-mono text-sm">
+              Failed to load {COMPARE_LABELS[compareWith].filename}: {altCodeError}
+            </div>
+          ) : !altReady ? (
+            <div className="p-6 text-ink-400 font-mono text-sm">
+              Loading {COMPARE_LABELS[compareWith].filename}…
+            </div>
+          ) : (
+            <CodeDiff leftCode={code} rightCode={altCode} />
+          )
         ) : (
           <CodeViewer code={code} />
         )}
       </div>
     </section>
+  );
+}
+
+function ImplTabs({
+  active,
+  onSelect,
+}: {
+  active: Impl;
+  onSelect: (tab: Impl) => void;
+}) {
+  const tabs: { id: Impl; label: string }[] = [
+    { id: "python", label: "python" },
+    { id: "pytorch", label: "pytorch" },
+    { id: "tinygrad", label: "tinygrad" },
+  ];
+  return (
+    <div
+      role="tablist"
+      aria-label="Implementation"
+      className="inline-flex items-center gap-0.5 rounded-md border border-ink-700 bg-ink-800/60 p-0.5"
+    >
+      {tabs.map((t) => {
+        const isActive = active === t.id;
+        return (
+          <button
+            key={t.id}
+            type="button"
+            role="tab"
+            aria-selected={isActive}
+            onClick={() => onSelect(t.id)}
+            className={`px-2 py-0.5 rounded text-[11px] font-mono transition-colors ${
+              isActive
+                ? "bg-ink-700/80 text-ink-100"
+                : "text-ink-300 hover:text-ink-100 hover:bg-ink-700/40"
+            }`}
+          >
+            {t.label}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
