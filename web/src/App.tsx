@@ -618,13 +618,13 @@ function Header({
       <div className="flex items-center gap-3">
         <Logo />
         <div className="flex flex-col">
-          <h1 className="flex items-center gap-1.5 text-[22px] leading-none font-semibold tracking-tight">
-            <span className="bg-gradient-to-r from-violet-300 via-fuchsia-300 to-amber-200 bg-clip-text text-transparent">
+          <h1 className="flex items-center gap-1.5 text-[22px] leading-[1.15] font-semibold tracking-tight">
+            <span className="bg-gradient-to-r from-violet-300 via-fuchsia-300 to-amber-200 bg-clip-text text-transparent pb-0.5">
               microgpt
             </span>
             <AboutPopover />
           </h1>
-          <p className="text-[12px] text-ink-300 mt-1">
+          <p className="text-[12px] text-ink-300">
             200 lines of pure Python — train a GPT in your browser
           </p>
         </div>
